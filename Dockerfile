@@ -1,328 +1,36 @@
-# Choose a base image.  Sensible options include ubuntu:xx.xx, nvidia/cuda:xx-cuddnx
-ARG BASE_IMAGE
+ARG PYTORCH_BASE=vastai/pytorch:2.5.1-cuda-12.1.1-py311
 
-### Build Caddy with single port TLS redirect
-FROM --platform=$BUILDPLATFORM golang:1.23.4-bookworm AS caddy_builder
-
-# Install xcaddy for the current architecture
-RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
-
-# Build Caddy
-ENV CGO_ENABLED=0
-ARG TARGETARCH
-RUN GOOS=linux GOARCH=$TARGETARCH xcaddy build \
-    --with github.com/caddyserver/caddy/v2=github.com/ai-dock/caddy/v2@httpredirect \
-    --with github.com/caddyserver/replace-response
-
-### Main Build ###
-
-FROM ${BASE_IMAGE} AS main_build
+FROM ${PYTORCH_BASE}
 
 # Maintainer details
 LABEL org.opencontainers.image.source="https://github.com/vastai/"
-LABEL org.opencontainers.image.description="Base image suitable for Vast.ai."
-LABEL maintainer="Vast.ai Inc <contact@vast.ai>"
+LABEL org.opencontainers.image.description="Llama.cpp Vast.ai image"
+LABEL maintainer="Ruslan Veselov <rv@rakkade.su>"
 
-# Support pipefail so we don't build broken images
-SHELL ["/bin/bash", "-c"]
+# Copy Supervisor configuration and startup scripts
+COPY ./ROOT /
 
-# Add some useful scripts and config files
-COPY ./ROOT/ /
-
-# Vast.ai environment variables used for Jupyter & Data sync
-ENV DATA_DIRECTORY=/workspace
-ENV WORKSPACE=/workspace
-
-# Ubuntu 24.04 requires this for compatibility with our /.launch script
-ENV PIP_BREAK_SYSTEM_PACKAGES=1
-
-# Don't ask questions we cannot answer during the build
-ENV DEBIAN_FRONTEND=noninteractive
-# Allow immediate output
-ENV PYTHONUNBUFFERED=1
-
-# Blackwell fix
-ARG BASE_IMAGE
-RUN \
-    # Update libnccl for Blackwell GPUs
-    set -euo pipefail && \
-    if [[ "$BASE_IMAGE" == "nvidia/cuda:12.8"* ]]; then \
-        NCCL_VERSION=$(dpkg-query -W -f='${Version}' libnccl2 2>/dev/null | cut -d'-' -f1 || echo "0.0.0"); \
-        if dpkg --compare-versions "$NCCL_VERSION" lt "2.26.2"; then \
-            apt-get -y update; \
-            apt-get install -y --allow-change-held-packages libnccl2 libnccl-dev; \
-        fi; \
-    fi && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Interactive container
 RUN \
     set -euo pipefail && \
-    # Not present in Ubuntu 24.04
-    if ! command -v unminimize >/dev/null 2>&1; then \
-        apt-get update; \
-        apt-get install -y --no-install-recommends unminimize; \
-    fi && \
-    printf "%s\n%s" y y | unminimize && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    . /venv/main/bin/activate && \
+    # We have PyTorch pre-installed so we will check at the end of the install that it has not been clobbered
+    torch_version_pre="$(python -c 'import torch; print (torch.__version__)')" && \
+    # Install xformers while pinning to the inherited torch version.  Fail build on dependency resolution if matching version is unavailable
+    pip install xformers torch==$PYTORCH_VERSION --index-url "${PYTORCH_INDEX_URL}" && \
+    pip install onnxruntime-gpu && \
+    # Get Llama.cpp
+    mkdir -p /opt/llama.cpp/bin && \
+    cd /tmp && \
+    apt-get install libcurl4-openssl-dev && \
+    git clone https://github.com/ggerganov/llama.cpp && \
+    cmake llama.cpp -B /tmp/llama.cpp/build \
+        -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DLLAMA_CURL=ON && \
+    cmake --build /tmp/llama.cpp/build --config Release -j --clean-first --target llama-quantize llama-cli llama-server llama-gguf-split && \
+    cp /tmp/llama.cpp/build/bin/llama-* /opt/llama.cpp/bin && \
+    rm -rf /tmp/llama.cpp && \
+    mkdir -p /opt/workspace-internal/llama.cpp/models/ && \
+    # Test 1: Verify PyTorch version is unaltered
+    torch_version_post="$(python -c 'import torch; print (torch.__version__)')" && \
+    [[ $torch_version_pre = $torch_version_post ]] || { echo "PyTorch version mismatch (wanted ${torch_version_pre} but got ${torch_version_post})"; exit 1; }
 
-# Create a useful base environment with commonly used tools
-ARG TARGETARCH
-RUN \
-    set -euo pipefail && \
-    ([ $TARGETARCH = "arm64" ] && echo "Skipping i386 architecture for ARM builds" || dpkg --add-architecture i386) && \
-    apt-get update && \
-    apt-get upgrade -y && \
-    apt-get install --no-install-recommends -y \
-        software-properties-common \
-        gpg-agent && \
-    # For alternative Python versions.  Nightly as fallback is helpful when building ARM images with recent Python versions
-    add-apt-repository -y ppa:deadsnakes/ppa && \
-    add-apt-repository -y ppa:deadsnakes/nightly && \
-    mkdir -p /etc/apt/preferences.d && \
-    echo $'Package: *\nPin: release o=LP-PPA-deadsnakes-ppa\nPin-Priority: 900\n\nPackage: *\nPin: release o=LP-PPA-deadsnakes-nightly\nPin-Priority: 50' \
-        > /etc/apt/preferences.d/deadsnakes-priority && \
-    apt-get update && \
-    apt-get install --no-install-recommends -y \
-        # Base system utilities
-        acl \
-        ca-certificates \
-        locales \
-        lsb-release \
-        curl \
-        wget \
-        sudo \
-        moreutils \
-        nano \
-        vim \
-        less \
-        jq \
-        git \
-        git-lfs \
-        man \
-        tzdata \
-        # Display
-        fonts-dejavu \
-        fonts-freefont-ttf \
-        fonts-ubuntu \
-        ffmpeg \
-        libgl1 \
-        libglx-mesa0 \
-        # System monitoring & debugging
-        htop \
-        iotop \
-        strace \
-        libtcmalloc-minimal4 \
-        lsof \
-        procps \
-        psmisc \
-        nvtop \
-        # Development essentials
-        build-essential \
-        cmake \
-        ninja-build \
-        gdb \
-        # System Python
-        python3-full \
-        python3-dev \
-        python3-pip \
-        # Network utilities
-        netcat-traditional \
-        net-tools \
-        dnsutils \
-        iproute2 \
-        iputils-ping \
-        traceroute \
-        # File management
-        rsync \
-        rclone \
-        zip \
-        unzip \
-        xz-utils \
-        zstd \
-        # Performance analysis
-        linux-tools-common \
-        # Process management
-        supervisor \
-        cron \
-        # Required for cron logging
-        rsyslog \
-        # OpenCL General
-        clinfo \
-        pocl-opencl-icd \
-        opencl-headers \
-        ocl-icd-dev \
-        ocl-icd-opencl-dev && \
-    # Ensure TensorRT where applicable
-    if [ -n "${CUDA_VERSION:-}" ]; then \
-        CUDA_MAJOR_MINOR=$(echo ${CUDA_VERSION} | cut -d. -f1,2) && \
-        nvinfer10_version=$(apt-cache madison libnvinfer10 | grep cuda${CUDA_MAJOR_MINOR} | awk '{print $3}' | sort -V | tail -n1 || true) && \
-        # Only CUDA 12.0 and 11.8 are available and we do not support < 11.8
-        nvinfer8_version=$(apt-cache madison libnvinfer8 | grep cuda${CUDA_MAJOR_MINOR%.*} | awk '{print $3}' | sort -V | tail -n1 || true) && \
-        if [[ -n "$nvinfer10_version" ]]; then \
-            apt-get install -y --no-install-recommends \
-                libnvinfer10=$nvinfer10_version \
-                libnvinfer-plugin10=$nvinfer10_version; \
-                libnvonnxparsers10=$nvinfer10_version; \
-                apt-mark hold libnvinfer10 libnvinfer-plugin10 libnvonnxparsers10; \
-        elif [[ -n "$nvinfer8_version" ]]; then \
-            apt-get install -y --no-install-recommends \
-                libnvinfer8=$nvinfer8_version \
-                libnvinfer-plugin8=$nvinfer8_version; \
-                libnvonnxparsers8=$nvinfer8_version; \
-                apt-mark hold libnvinfer8 libnvinfer-plugin8 libnvonnxparsers8; \
-        fi \
-    fi && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-    # Install Extra Nvidia packages (OpenCL)
-    # When installing libnvidia packages always pick the earliest version to avoid mismatched libs
-    # We cannot know the runtime driver version so we aim for best compatibility 
-    ARG TARGETARCH
-    RUN \
-    set -euo pipefail && \
-    apt-get update && \
-    if command -v rocm-smi >/dev/null 2>&1; then \
-        apt-get install -y rocm-opencl-runtime; \
-    elif [[ -n "${CUDA_VERSION:-}" ]]; then \
-        CUDA_MAJOR_MINOR=$(echo "${CUDA_VERSION}" | cut -d. -f1,2 | tr -d ".") && \
-        driver_version=""; \
-        case "${CUDA_MAJOR_MINOR}" in \
-            "118") driver_version=450 ;; \
-            "120") driver_version=525 ;; \
-            "121") driver_version=530 ;; \
-            "122") driver_version=535 ;; \
-            "123") driver_version=545 ;; \
-            "124") driver_version=550 ;; \
-            "125") driver_version=555 ;; \
-            "126") driver_version=560 ;; \
-            "127") driver_version=565 ;; \
-            "128") driver_version=570 ;; \
-        esac; \
-        if [[ -n "$driver_version" ]]; then \
-            if [[ "${TARGETARCH}" = "arm64" ]] && [[ "$driver_version" -lt 550 ]]; then \
-                echo "No suitable libnvidia-compute package is available for arm64 with driver ${driver_version}"; \
-            else \
-                compute_version=$(apt-cache madison "libnvidia-compute-${driver_version}" | awk '{print $3}' | sort -V | head -n1 || true); \
-                if [[ -n "$compute_version" ]]; then \
-                    apt-get install -y "libnvidia-compute-${driver_version}=$compute_version"; \
-                    apt-mark hold "libnvidia-compute-${driver_version}"; \
-                fi; \
-            fi; \
-        fi; \
-    fi && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-    
-
-# Add a normal user account - Some applications don't like to run as root so we should save our users some time.  Give it unfettered access to sudo
-RUN \
-    set -euo pipefail && \
-    groupadd -g 1001 user && \
-    useradd -ms /bin/bash user -u 1001 -g 1001 && \
-    echo "PATH=${PATH}" >> /home/user/.bashrc && \
-    echo "user ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/user && \
-    sudo chmod 0440 /etc/sudoers.d/user && \
-    mkdir -m 700 -p /run/user/1001 && \
-    chown 1001:1001 /run/user/1001 && \
-    mkdir -p /run/dbus && \
-    mkdir -p /opt/workspace-internal/ && \
-    chown 1001:1001 /opt/workspace-internal/ && \
-    chmod g+s /opt/workspace-internal/ && \
-    chmod 775 /opt/workspace-internal/ && \
-    setfacl -d -m g:user:rw- /opt/workspace-internal/
-
-# Install NVM for node version management
-RUN \
-    set -euo pipefail && \
-    git clone https://github.com/nvm-sh/nvm.git /opt/nvm && \
-    (cd /opt/nvm/ && git checkout `git describe --abbrev=0 --tags --match "v[0-9]*" $(git rev-list --tags --max-count=1)`) && \
-    source /opt/nvm/nvm.sh && \
-    nvm install --lts && \
-    echo "source /opt/nvm/nvm.sh" >> /root/.bashrc && \
-    echo "source /opt/nvm/nvm.sh" >> /home/user/.bashrc
-
-# Add the 'service portal' web app into this container to avoid needing to specify in onstart.  
-# We will launch each component with supervisor - Not the standalone launch script.
-COPY ./portal-aio /opt/portal-aio
-COPY --from=caddy_builder /go/caddy /opt/portal-aio/caddy_manager/caddy
-ARG TARGETARCH
-RUN \
-    set -euo pipefail && \
-    apt-get update && \
-    apt-get install --no-install-recommends -y \
-        python3.10-venv && \
-    python3.10 -m venv /opt/portal-aio/venv && \
-    mkdir -m 770 -p /var/log/portal && \
-    chown 0:1001 /var/log/portal/ && \
-    mkdir -p opt/instance-tools/bin/ && \
-    /opt/portal-aio/venv/bin/pip install -r /opt/portal-aio/requirements.txt && \
-    wget -O /opt/portal-aio/tunnel_manager/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${TARGETARCH} && \
-    chmod +x /opt/portal-aio/tunnel_manager/cloudflared && \
-    # Make these portal-provided tools easily reachable
-    ln -s /opt/portal-aio/caddy_manager/caddy /opt/instance-tools/bin/caddy && \
-    ln -s /opt/portal-aio/tunnel_manager/cloudflared /opt/instance-tools/bin/cloudflared && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# Populate the system Python environment with useful tools.  Add jupyter to speed up instance creation and install tensorboard as it is quite useful if training
-# These are in the system and not the venv because we want that to be as clean as possible
-RUN \
-    set -euo pipefail && \
-    cd /opt && \
-    git clone https://github.com/vast-ai/vast-cli && \
-    wget -O /usr/local/share/ca-certificates/jvastai.crt https://console.vast.ai/static/jvastai_root.cer && \
-    update-ca-certificates && \
-    pip install --no-cache-dir \
-        jupyter \
-        tensorboard
-
-# Install Syncthing
-ARG TARGETARCH
-RUN \
-    set -euo pipefail && \
-    SYNCTHING_VERSION="$(curl -fsSL "https://api.github.com/repos/syncthing/syncthing/releases/latest" | jq -r '.tag_name' | sed 's/[^0-9\.\-]*//g')" && \
-    SYNCTHING_URL="https://github.com/syncthing/syncthing/releases/download/v${SYNCTHING_VERSION}/syncthing-linux-${TARGETARCH}-v${SYNCTHING_VERSION}.tar.gz" && \
-    mkdir /opt/syncthing/ && \
-    wget -O /opt/syncthing.tar.gz $SYNCTHING_URL && (cd /opt && tar -zxf syncthing.tar.gz -C /opt/syncthing/ --strip-components=1) && rm -f /opt/syncthing.tar.gz
-
-ARG PYTHON_VERSION=3.10
-ENV PYTHON_VERSION=${PYTHON_VERSION}
-RUN \
-    set -euo pipefail && \
-    apt-get update && \
-    # Supplementary Python
-    apt-get install --no-install-recommends -y \
-        python${PYTHON_VERSION} \
-        python${PYTHON_VERSION}-dev \
-        python${PYTHON_VERSION}-venv \
-        python${PYTHON_VERSION}-tk && \
-    mkdir -p /venv && \
-    # Create a virtual env - This gives us portability without sacrificing any functionality
-    python${PYTHON_VERSION} -m venv /venv/main && \
-    /venv/main/bin/pip install --no-cache-dir \
-        wheel \
-        huggingface_hub[cli] \
-        ipykernel \
-        ipywidgets && \
-    /venv/main/bin/python -m ipykernel install \
-        --name="main" \
-        --display-name="Python3 (main venv)" && \
-    # Re-add as default.  We don't want users accidentally installing packages in the system python
-    /venv/main/bin/python -m ipykernel install \
-        --name="python3" \
-        --display-name="Python3 (ipykernel)" && \
-    # Add a cron job to regularly backup all venvs in /venv/*
-    echo "*/30 * * * * /opt/instance-tools/bin/venv-backup.sh" | crontab - && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
-
-ENV PATH=/opt/instance-tools/bin:${PATH}
-
-ENTRYPOINT ["/opt/instance-tools/bin/entrypoint.sh"]
-CMD []
-
-WORKDIR /workspace/
+    ENV PATH="${PATH}:/opt/llama.cpp/bin"

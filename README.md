@@ -1,73 +1,166 @@
-# Vast.ai Base Docker Image
+# Open WebUI + Ollama
 
-Welcome to the Vast.ai base Docker image project! This repository provides everything you need to build a versatile Docker image that works seamlessly with both Nvidia CUDA (supporting AMD64 & ARM64 architectures) and AMD ROCm (AMD64) instances on [Vast.ai](https://vast.ai).
+> Open WebUI is an extensible, self-hosted AI interface that adapts to your workflow
 
-Getting started is easy - you can either:
-- Use our pre-built images from [DockerHub](https://hub.docker.com/repository/docker/vastai/base-image/tags), perfect for extending with your own customizations
-- Build the image from scratch by cloning this repository
 
-Our pre-built images are based on either [nvidia/cuda](https://hub.docker.com/r/nvidia/cuda/tags) or [rocm/dev-ubuntu-22.04](https://hub.docker.com/r/rocm/dev-ubuntu-22.04/tags). While these are substantial images, you'll find they start up quickly on most host machines thanks to Docker's layer caching system - Many of our recommended templates will be derrived from this base image.
+## Contents
 
-## Key Features
+1. [About the open Webui Image](#about-the-open-webui-image)
+    - [Upgrading Open Webui](#upgrading-open-webui)
+    - [Upgrading Ollama](#upgrading-ollama)
+    - [Migrating to a new Instance](#migrating-to-a-new-instance)
+2. [Connecting to the Instance](#connecting-to-the-instance)
+3. [Additional Software](#additional-software)
+4. [Application Management](#application-management)
+5. [Instance Startup Process](#instance-startup-process)
+6. [Python Package Management](#python-package-management)
+7. [Environment Variables](#environment-variables)
+8. [Dynamic Provisioning](#dynamic-provisioning)
+9. [Useful Links](#useful-links)
 
-Our base image comes packed with features designed to make your development experience smoother:
+## About the Open WebUI Image
 
-**Platform Support**
-- Multi-architecture compatibility (AMD64/ARM64)
-- Launch flexibility with Jupyter, SSH, and Args modes
-- Full support for CUDA, OpenCL & ROCm
+This Open WebUI image is built and maintained by Vast.ai. It contains development libraries to enable building custom extensions and add-ons. Please see the associated documentation below for configuration details.
 
-**Development Tools**
-- Built-in [Vast CLI](https://pypi.org/project/vastai/) for seamless instance management
-- Python virtual environment pre-configured in `/workspace`
-- Non-root `user` account for applications with root restrictions
-- Extensive application suite for remote development
+__Important: Open Webui provides its own authentication mechanism.  Normal token auth is disabled by default for port 7500.  You should create an admin user with a strong password to secure your installation__
 
-**Security & Connectivity**
-- [Instance Portal](#instance-portal) providing TLS, secure tunnels, and authentication
-- Workspace portability between instances (including Python packages)
-- [Supervisor](https://supervisord.readthedocs.io/en/latest/) for reliable application management
+Open Webui configuration and databases are stored in `/workspace/webui`
 
-**Customization**
-- Remote configuration support via `PROVISIONING_SCRIPT` environment variable
-- Easy to extend with additional applications and tools
+The configuration directory for Ollama is `/workspace/ollama`, where you can download models.
 
-## Instance Portal
+No models are included in the Docker image, but a [provisioning script](#dynamic-provisioning) can be declared with the environment variable `PROVISIONING_SCRIPT`. When the instance first starts, this script will be downloaded and executed so can be used to ensure models are pulled prior to starting the interface and API.
+
+The base image application `Tensorboard` has been disabled in this template.
+
+### Upgrading Open Webui
+
+Open WebUI can be upgraded simply by upgrading the python package and restarting:
+
+```bash
+pip install -U open-webui
+supervisorctl restart open_webui
+```
+
+### Upgrading Ollama
+
+Ollama is installed into `/usr`.  To upgrade it simply download the desired Linux release, extract it and restart the Ollama service:
+
+```bash
+wget -O /tmp/ollama.tgz https://github.com/ollama/ollama/releases/download/${OLLAMA_REF}/ollama-linux-$amd64.tgz
+tar -C /usr -xzf /tmp/ollama.tgz
+supervisorctl restart ollama
+```
+
+### Migrating to a New Instance
+
+#### Required Steps
+
+1. On the __destination__ instance:
+   - Open a terminal (virtual environment activates automatically)
+   - Run: `cd /workspace/ && rm -rf ollama && rm -rf webui`
+
+2. Complete an instance to instance transfer from the source instance to the destination instance. Source and destination directories should both be set to `/workspace/`
+
+3. On the __destination__ instance:
+   - Open a terminal (virtual environment activates automatically)
+   - Navigate to: `/workspace/.venv-backups/{source-instance-id}/`
+   - Run: `pip install --no-cache-dir -r venv-main-latest.txt`
+   - Reboot the instance
+
+#### Important Notes
+
+- Always use the same docker image for both instances
+- For detailed data transfer instructions, consult [vast.ai docs](https://vast.ai/docs/data-management/data-movement)
+
+## Connecting to the Instance
+
+There are several methods you can use to interact with your instance.
+
+### Jupyter Button
+
+Press the Jupyter button to be immediately logged in to  Jupyter Lab or Notebook (Configure this in the template settings).  Here you can:
+- Manage your files
+- Run Jupyter notebooks
+- Open a terminal session
+
+### SSH
+
+Press the SSH button to reveal the SSH connection details for your instance.  We only support key based SSH login so check out [this guide](https://docs.vast.ai/instances/sshscp) for help setting this up.
+
+SSH sessions will automatically launch inside tmux to keep the session active even if you disconnect.  You can disable this behavior by running the following command `touch ~/.no_auto_tmux` and then re-connecting.
+
+If you prefer not to add SSH keys, you can use Jupyter based terminals instead.
+
+### SSH Port Forwarding
+
+Instead of connecting to ports exposed to the internet, you can use SSH port forwarding to securely access services on your instance. This method connects directly to the internal ports, bypassing the [Caddy](#caddy) authentication layer.
+
+#### Port Reference Table
+
+| Service | External Port | Internal Port |
+| --- | --- | --- |
+| Instance Portal | 1111 | 11111 |
+| Open Webui | 7500 | 17500 |
+| Ollama | 11434 | 21434 |
+| Syncthing | 8384 | 18384 |
+| Jupyter | 8080 | 8080 |
+
+When creating SSH port forwards, use the internal ports listed above. These ports don't require authentication or TLS since they're only accessible through your SSH tunnel. See the [Instance Portal](#open-button-instance-portal) for more details on this security model.
+
+* Note: Jupyter is not proxied when run in the default 'Jupyter' startup mode, so forwarding this will require a connection to https://localhost:8080 and you will need to supply the auth token which is stored in the instance in environment variable `JUPYTER_TOKEN`.  To run a proxied Jupyter application, you should run the instance in SSH or Entrypoint mode with Jupyter's configuration retained in the `PORTAL_CONFIG` variable.
+
+#### Example: Forwarding Open WebUI & Ollama to localhost
+
+To forward both Open WebUI & Ollama to your local machine:
+
+```bash
+ssh root@INSTANCE_IP -p SSH_PORT -L 7500:localhost:17500 -L 11434:localhost:21434
+```
+
+This command:
+
+- Creates SSH local port forwards for your localhost:7500 (OpenWebui) and localhost:11434 (Ollama)
+- Connects to the instance internal Open WebUI port (17500) and Ollama port (21434)
+- Allows you to access the applications at http://localhost:7500 and http://localhost:11434 on your machine
+- Maintains a secure, encrypted connection through SSH
+
+The applications will now be available on your local machine without requiring the authentication that would be needed when accessing the externally exposed port.
+
+
+
+### Open Button (Instance Portal)
 
 The Instance Portal is your gateway to managing web applications running on your instance. It uses [Caddy](https://caddyserver.com/) as a reverse proxy to provide secure TLS and authentication for all your applications.
 
-### Getting Started
+#### Getting Started
 
-1. **Set Up TLS**: To avoid certificate warnings, install the 'Jupyter' certificate by following our [instance setup guide](https://vast.ai/docs/instance-setup/jupyter#installing-the-tls-certificate).
+1. **Set Up TLS**: To avoid certificate warnings, install the 'Jupyter' certificate by following our [instance setup guide](https://docs.vast.ai/instances/jupyter).
 
-2. **Launch Applications**: When starting web applications, configure them to listen on `localhost`. Don't expose ports directly (`-p port:port`) - Caddy will handle this using TLS certificates stored at `/etc/instance.crt` and `/etc/instance.key`.
+2. **Access Your Applications**: Simply click the 'Open' button on your instance card:
 
-3. **Access Your Applications**: Simply click the 'Open' button on your instance card:
-
-![Open Button](docs/images/instance-card-open-button.png)
+![Open Button](https://raw.githubusercontent.com/vast-ai/base-image/refs/heads/main/docs/images/instance-card-open-button.png)
 
 This sets a cookie using your `OPEN_BUTTON_TOKEN`, granting you access. Without this, you'll see a login prompt (username: `vastai`, password: your `OPEN_BUTTON_TOKEN`).
 
-### Programmatic Access
+#### Programmatic Access
 
 For automated or API access, you can authenticate to any application by including a Bearer token in your HTTP requests:
 
 ```bash
-Authorization: Bearer ${OPEN_BUTTON_TOKEN}
+Authorization: Bearer <OPEN_BUTTON_TOKEN>
 ```
 
 This is particularly useful for scripts, automated tools, or when you need to access your applications programmatically without browser interaction.
-Once logged in, you'll see your application dashboard:
 
-![Instance Portal landing page](docs/images/instance-portal-application-list.png)
+Once logged in, you'll see your application dashboard
 
-The dashboard shows all available ports and their corresponding applications. The Instance Portal automatically creates Cloudflare tunnels - perfect for sharing temporary application links or accessing your instance when direct connections aren't available.
+The dashboard shows all available ports and their corresponding applications. The Instance Portal can create Cloudflare tunnels - perfect for sharing temporary application links or accessing your instance when direct connections aren't available.
 
 Start, stop, and refresh tunnel links using the dashboard controls.
 
-### Managing Tunnels
+![Instance Portal landing page](https://raw.githubusercontent.com/vast-ai/base-image/refs/heads/main/docs/images/instance-portal-application-list.png)
 
-![Instance Portal tunnels tab](docs/images/instance-portal-tunnels.png)
+#### Managing Tunnels
 
 The Tunnels tab displays your active Cloudflare tunnels. You can:
 - View existing tunnels linked to running applications
@@ -78,110 +171,41 @@ Tunnels displayed in this tab will show the direct mapping between the local and
 
 Want to use custom domains or virtual networks? Set the `CF_TUNNEL_TOKEN` environment variable to enable domain mapping. Check out the [Cloudflare documentation](https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/) for details.
 
-### Monitoring Your Instance
+![Instance Portal tunnels tab](https://raw.githubusercontent.com/vast-ai/base-image/refs/heads/main/docs/images/instance-portal-tunnels.png)
 
-![Instance Portal logs tab](docs/images/instance-portal-logs.png)
+#### Monitoring Your Instance
 
 The Logs tab provides live streaming of all `*.log` files from `/var/log/portal/`. Outputs for the included applications are piped to `tee -a /var/log/portal/${PROC_NAME}.log`, making them accessible both within your instance and through the Vast GUI logging button.
 
-### Configuration
+![Instance Portal logs tab](https://raw.githubusercontent.com/vast-ai/base-image/refs/heads/main/docs/images/instance-portal-logs.png)
 
-The Instance Portal configuration lives in `/etc/portal.yaml`, generated on first start using your `PORTAL_CONFIG` environment variable.
 
-Default configuration:
-```yaml
-# Default PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|localhost:8080:8080:/:Jupyter|localhost:8384:18384:/:Syncthing"
+#### Configuration
 
-applications:
-  Instance Portal:
-    hostname: localhost
-    external_port: 1111
-    internal_port: 11111
-    open_path: /
-    name: Instance Portal
-  Jupyter:
-    hostname: localhost
-    external_port: 8080
-    internal_port: 8080 # Internal port = External Port: No proxying, only links
-    open_path: /
-    name: Jupyter
-  Syncthing:
-    hostname: localhost
-    external_port: 8384
-    internal_port: 18384
-    open_path: /
-    name: Syncthing
-```
+The Instance Portal configuration lives in `/etc/portal.yaml`, generated on first start using your `PORTAL_CONFIG` environment variable.  Learn more about this variable in the [Environment Variables](#environment-variables) section.
 
 Need to modify the configuration in a running instance? Edit `/etc/portal.yaml` anytime, then restart Caddy with `supervisorctl restart caddy`. Remember that any new applications will need their external ports to be available for direct access.
 
-## Applications & Startup
+## Additional Software
 
-The container starts with `/opt/instance-tools/bin/entrypoint.sh`, which handles the initial setup and launches your workspace environment. Here's what happens during startup:
+Jupyter is always started when run with the Jupyter launch mode.  All other software is managed by supervisord. 
 
-### Startup Sequence
-
-1. **Environment Setup**
-  - Configures Jupyter management via Supervisor if requested
-  - Stores environment variables in `/etc/environment` for login shell access
-  - Creates `/.provisioning` lock file for safe application startup
-  - Sets up SSH keys for non-root access
-
-2. **Workspace Preparation**
-  - Copies internal directory `/opt/workspace-internal` to `${WORKSPACE}` on first boot allowing for full rsync backup
-  - Generates TLS certificates if needed
-  - Starts Supervisor in the background
-
-3. **Custom Configuration**
-  - Downloads and executes any script defined in `PROVISIONING_SCRIPT`. Find the downloaded script at `/provisioning.sh`
-  - Removes the `/.provisioning` lock
-  - Maintains the container process until Supervisor stops
-
-### Application Management with Supervisor
-
-We use Supervisor to orchestrate applications in the container. Configuration files live in `/etc/supervisor/conf.d/`, with startup scripts in `/opt/supervisor-scripts/`.
-
-Rather than direct application launches, we use wrapper scripts for better control. This allows us to check for application entries in `/etc/portal.yaml` - if an application isn't configured, we assume you don't want to run it.
-
-Common Supervisor commands:
-```bash
-# View all processes
-supervisorctl status
-
-# Control specific services
-supervisorctl start jupyter
-supervisorctl stop syncthing
-supervisorctl restart caddy
-
-# Reload configuration after changes
-supervisorctl reload
-
-# Read recent logs
-supervisorctl tail jupyter
-supervisorctl tail -f syncthing  # Follow mode
-```
-
-Need more details? Check out the [Supervisor documentation](https://supervisord.readthedocs.io/en/latest).
-
-### Built-in Applications
-
-#### Jupyter
-
-The industry standard for interactive Python development. Perfect for prototyping, data analysis, and machine learning experiments. Our setup supports:
-- Starts via Instance Portal in SSH or Args launch modes
-- Requires internal port `18080` in `PORTAL_CONFIG` (handled automatically)
-- In Jupyter launch mode, managed by `/.launch` script instead
-- Customize configuration in `ROOT/opt/supervisor-scripts/jupyter.sh`
+Manage application startup by modifying the `PORTAL_CONFIG` environment variable before instance start, or by editing the file `/etc/portal.yaml` in a running instance.
 
 ### Caddy
 
-The Caddy web server is used to enable both HTTPS and authentication for exposed web applications.
+Caddy is a web server that adds HTTPS encryption and user authentication to web applications running on your cloud instance.
 
-Each application launched by this docker image will bind to `localhost` rather than the external interface.  Caddy will instead bind to the external interface and it will act as a reverse proxy to serve the application.
+Here's how it works:
+- Your applications run on your cloud instance, but they're only accessible through the instance's `localhost`
+- Caddy acts as a secure gateway between these applications and the internet
+- When you try to access your cloud applications from your personal computer, you connect through Caddy
 
-This setup makes it straightforward to access the application securely over the internet while still being able to connect without TLS or authentication via SSH Port Forwarding.
+This setup gives you two convenient ways to access your cloud applications:
+- Through your web browser with HTTPS security and login protection
+- Directly through SSH Port Forwarding from your computer, bypassing the need for HTTPS or login credentials
 
-#### Syncthing
+### Syncthing
 
 A powerful file synchronization tool that keeps your development environment in sync across devices. Ideal for maintaining consistent workspaces across multiple instances or syncing datasets. Features:
 - Peer-to-peer file synchronization
@@ -191,20 +215,25 @@ A powerful file synchronization tool that keeps your development environment in 
 
 See the [Syncthing documentation](https://docs.syncthing.net/) for setup instructions.
 
-#### Tensorboard
+Configure startup of Syncthing through the `PORTAL_CONFIG` environment variable.
+
+### Tensorboard
 
 Visualization toolkit for machine learning experiments, helping you track metrics, view model graphs, and analyze training results. Our configuration:
-- By default, monitors `/workspace`
+- By default, monitors `${WORKSPACE}` (default `/workspace`)
 - Customize log directory via `TENSORBOARD_LOG_DIR` environment variable
 - Automatically detects and displays new experiments
 
-#### Cron
+Configure startup of Tensorboard through the `PORTAL_CONFIG` environment variable.
+
+### Cron
 
 The reliable Linux task scheduler, perfect for automating routine tasks in your instance:
 - Schedule model training jobs
 - Automate data downloads
 - Run periodic maintenance tasks
 - Enabled in all launch modes
+
 Just add entries to your crontab to get started.
 
 ### OpenCL
@@ -215,7 +244,19 @@ A standardized framework for parallel programming across heterogeneous computing
 - Support for data and task parallelism
 - Memory management optimization
 
-#### NVM (Node Version Manager)
+### Vast.ai Instance Control
+
+The Vast.ai CLI tool comes pre-installed on your instance, allowing you to stop it from within. An instance-specific API key is already configured, giving you the ability to control this instance while you're logged in.
+
+To stop the instance from inside itself, run:
+
+```bash
+vastai stop instance $CONTAINER_ID
+```
+
+You can incorporate this command into scripts that run on the instance itself - for example, to shut down based on specific conditions. Combined with cron, you can automate when your instance stops based on your needs.
+
+### NVM (Node Version Manager)
 
 Manages Node.js environments, essential for many modern AI tools and visualization frameworks:
 - Pre-installed with latest LTS Node.js version
@@ -223,39 +264,113 @@ Manages Node.js environments, essential for many modern AI tools and visualizati
 - Enables local development of model visualization dashboards
 - Compatible with various AI/ML web interfaces and tools
 
+### Application Management
 
-## Building Your Own Image
+We use Supervisor to orchestrate applications in the container. Configuration files live in `/etc/supervisor/conf.d/`, with startup scripts in `/opt/supervisor-scripts/`.
 
-Getting started with our base image is straightforward - you don't need a GPU for the build process! GPUs are only required when running the container.
+Rather than directly launching applications, we use wrapper scripts for better control. This allows us to check for application entries in `/etc/portal.yaml` - if an application isn't configured here, we assume you don't want to run it.
 
-### Quick Start
 
+Common Supervisor commands:
 ```bash
-# Clone and build
-git clone https://github.com/vast-ai/base-image
-cd base-image
-docker buildx build --build-arg BASE_IMAGE=nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 --build-arg PYTHON_VERSION=3.10 .
+# View all processes
+supervisorctl status
+
+# Control specific services
+supervisorctl start ollama
+supervisorctl stop syncthing
+supervisorctl restart open_webui
+
+# Reload configuration after changes
+supervisorctl reload
+
+# Read recent logs
+supervisorctl tail caddy
+supervisorctl tail -f syncthing  # Follow mode
 ```
-Want to use a different base image? Just pass the `BASE_IMAGE` build argument during build.
 
-Optionally, pass build argument `PYTHON_VERSION` to set the Python version for the main virtual environment.
+Need more details? Check out the [Supervisor documentation](https://supervisord.readthedocs.io/en/latest).
 
-### Creating Custom Images
+### Instance Startup Process
 
-Need to add your own tools and configurations? Use our image as your starting point:
+The Docker image uses `/opt/instance-tools/bin/entrypoint.sh` as its startup script. This script handles both initial setup and routine startup tasks.
 
-```dockerfile
-FROM vastai/base-image:<TAG>
-```
+**First Time Setup:**
+- Updates the `vastai` Python package to the latest version
+- Sets up the `${WORKSPACE}` directory with proper permissions for both admin and user access
+- Configures login settings to:
+ - Automatically activate the default Python environment
+ - Start in the `${WORKSPACE}` directory
+- Creates a backup of the default Python environments
+- Runs any custom setup script defined in the `PROVISIONING_SCRIPT` environment variable
 
-#### Tips for customizing:
+**Every Time the Instance Starts:**
+- Sets up SSH access keys
+- Creates new security certificates if needed
+- Launches `supervisord` to manage running applications
 
-- Install your Python packages into `/venv/main/`
-- Add Supervisor config files for any new services
-- Create wrapper scripts for your services (check out our Jupyter and Syncthing scripts as examples)
+### Python Package Management
+
+**Default Environment:**
+- Python packages install to the `/venv/main/` virtual environment
+- This environment activates automatically when you:
+ - Connect via SSH
+ - Open a terminal in Jupyter
+ - Run Jupyter notebooks
+
+**Automatic Backups:**
+- Every 30 minutes, the system creates a backup of your Python packages
+- Backups are stored in `/workspace/.venv-backup/{INSTANCE_ID}/`
+- These backups let you:
+ - Undo recent package changes
+ - Recreate your exact environment on a new instance
+
+**Backup Settings:**
+- By default, keeps 48 backups (24 hours worth)
+- Adjust using the `VENV_BACKUP_COUNT` environment variable
+- Set to `0` to turn off backups
 
 
-## Dynamic Templates
+## Environment Variables
+
+Some more useful environment variables are provided for instance customization.
+
+| Variable | Type | Default | Description |
+| --- | --- | --- | --- |
+| `WORKSPACE` | string | `/workspace` | Set the workspace directory |
+| `ENABLE_AUTH` | bool | `true` | Enable or disable token-based and basic authentication |
+| `AUTH_EXCLUDE` | string | | Disable authentication for specific ports. eg. `6006,8384` |
+| `ENABLE_HTTPS` | bool | `true` | Enable or disable TLS |
+| `PORTAL_CONFIG` | string | See note below | Configures the Instance Portal and application startup |
+| `VENV_BACKUP_COUNT` | int | `48` | Number of venv backups to retain |
+| `PROVISIONING_SCRIPT` | string | | URL pointing to a shell script (GitHub Repo, Gist) |
+| `TENSORBOARD_LOG_DIR` | string | `/workspace` | Log directory for Tensorboard |
+| `OPENWEBUI_ARGS` | string | `--host 127.0.0.1 --port 17500` | Startup arguments to pass to Open Webui |
+| `OLLAMA_ARGS` | string | | Startup arguments to pass to `ollama serve` |
+
+#### PORTAL_CONFIG
+
+The structure of this variable is:
+- Each application is separated by the `|` character
+- Each application parameter is separated by the `:` character
+- Each application must specify `hostname:external_port:local_port:url_path:Application Name`
+
+The hostname in Docker instances will always be `localhost`
+
+Where the internal port and local port are not equal then Caddy will be configured to listen on `0.0.0.0:external_port` acting as a reverse proxy for `hostname:local_port`
+
+If the `external_port` and `local_port` are equal then Caddy will not act as a proxy but the Instance Portal UI will still create links. This is useful because it allows us to create links to Jupyter which is not controlled by Supervisor in Jupyter Launch mode.
+
+`url_path` will be appended to the instance address and is generally set to `/` but can be used to create application deep links.
+
+The `caddy_manager` script will write an equivalent config file at `/etc/portal.yaml` on boot if it does not already exist. This file can be edited in a running instance.
+
+Important: When defining multiple links to a single application, only the first should have non equal ports - We cannot proxy one application multiple times.
+
+Note: Instance Portal UI is **not** required and its own config declaration can be removed from `PORTAL_CONFIG`. This will not affect the authentication system.
+
+
+## Dynamic Provisioning
 
 Sometimes you need flexibility without rebuilding the entire image. For quick customizations:
 
@@ -277,33 +392,25 @@ set -eo pipefail
 pip install your-packages
 
 # Download some useful files
-wget -P /workspace/ https://example.org/useful-files.tar.gz
+wget -P "${WORKSPACE}/" https://example.org/my-application.tar.gz
+tar xvf ${WORKSPACE}/my-application.tar.gz"
 
 # Set up any additional services
-echo "your-supervisor-config" > /etc/supervisor/conf.d/your-service.conf
-echo "your-supervisor-wrapper" > /opt/supervisor-scripts/your-service.sh
-chmod +x /opt/supervisor-scripts/your-service.sh
+echo "my-supervisor-config" > /etc/supervisor/conf.d/my-application.conf
+echo "my-supervisor-wrapper" > /opt/supervisor-scripts/my-application.sh
+chmod +x /opt/supervisor-scripts/my-application.sh
 
 # Reconfigure the instance portal
 rm -f /etc/portal.yaml
-PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|localhost:1234:11234:/:My Application"
+export PORTAL_CONFIG="localhost:1111:11111:/:Instance Portal|localhost:1234:11234:/:My Application"
 
 # Reload Supervisor
 supervisorctl reload
 ```
 
-Remember to expose the necessary ports and provide a suitable `PORTAL_CONFIG`.
 
-## Template Links
+## Useful Links
 
-Check out these templates to see the default configuration in action:
-
-[Jupyter Launch Mode](https://cloud.vast.ai/?ref_id=62897&creator_id=62897&name=Vast%20Base%20Image)
-
-[SSH Launch Mode](https://cloud.vast.ai/?ref_id=62897&creator_id=62897&name=Vast%20Base%20Image%20-%20SSH)
-
-[Args Launch Mode](https://cloud.vast.ai/?ref_id=62897&creator_id=62897&name=Vast%20Base%20Image%20-%20ARGS)
-
-[Jupyter (ARM64)](https://cloud.vast.ai/?ref_id=62897&creator_id=62897&name=Vast%20Base%20Image%20-%20ARM64)
-
-[Jupyter (AMD ROCm)](https://cloud.vast.ai/?ref_id=62897&creator_id=62897&name=Vast%20Base%20Image%20-%20AMD%20ROCm)
+- [Open WebUI](https://docs.openwebui.com/)
+- [Ollama](https://ollama.com/)
+- [Image Source](https://github.com/vast-ai/base-image/tree/main/derivatives/PyTorch/derivatives/openwebui)
